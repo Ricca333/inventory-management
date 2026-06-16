@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
+from datetime import datetime, timedelta
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -80,6 +81,7 @@ class Order(BaseModel):
     actual_delivery: Optional[str] = None
     warehouse: Optional[str] = None
     category: Optional[str] = None
+    lead_time_days: Optional[int] = None
 
 class DemandForecast(BaseModel):
     id: str
@@ -89,6 +91,7 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float
 
 class BacklogItem(BaseModel):
     id: str
@@ -118,6 +121,13 @@ class CreatePurchaseOrderRequest(BaseModel):
     quantity: int
     unit_cost: float
     expected_delivery_date: str
+    notes: Optional[str] = None
+
+class CreateOrderRequest(BaseModel):
+    items: List[dict]  # [{ sku, name, quantity, unit_price }]
+    warehouse: Optional[str] = None
+    category: Optional[str] = None
+    lead_time_days: Optional[int] = 14
     notes: Optional[str] = None
 
 # API endpoints
@@ -160,6 +170,51 @@ def get_order(order_id: str):
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     return order
+
+@app.post("/api/orders", response_model=Order, status_code=201)
+def create_order(request: CreateOrderRequest):
+    """Create a new (restocking) order from the Restocking tab.
+
+    Appends to the in-memory orders list with status 'Submitted'. Not persisted
+    to disk - resets on server restart (matches the app's in-memory data model.
+    """
+    if not request.items:
+        raise HTTPException(status_code=400, detail="Order must contain at least one item")
+
+    # Generate next numeric id and ORD-2025-XXXX order number from existing orders
+    numeric_ids = [int(o["id"]) for o in orders if str(o.get("id", "")).isdigit()]
+    next_id = (max(numeric_ids) + 1) if numeric_ids else 1
+
+    existing_seqs = []
+    for o in orders:
+        num = o.get("order_number", "")
+        if num.startswith("ORD-") and num.split("-")[-1].isdigit():
+            existing_seqs.append(int(num.split("-")[-1]))
+    next_seq = (max(existing_seqs) + 1) if existing_seqs else 1
+
+    lead_time = request.lead_time_days if request.lead_time_days is not None else 14
+    now = datetime.now()
+    total_value = sum(
+        item.get("quantity", 0) * item.get("unit_price", 0) for item in request.items
+    )
+
+    new_order = {
+        "id": str(next_id),
+        "order_number": f"ORD-2025-{next_seq:04d}",
+        "customer": "Internal Restock",
+        "items": request.items,
+        "status": "Submitted",
+        "order_date": now.isoformat(timespec="seconds"),
+        "expected_delivery": (now + timedelta(days=lead_time)).isoformat(timespec="seconds"),
+        "total_value": round(total_value, 2),
+        "actual_delivery": None,
+        "warehouse": request.warehouse,
+        "category": request.category,
+        "lead_time_days": lead_time,
+    }
+
+    orders.append(new_order)
+    return new_order
 
 @app.get("/api/demand", response_model=List[DemandForecast])
 def get_demand_forecasts():
